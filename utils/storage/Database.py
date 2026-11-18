@@ -6,7 +6,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-from utils.Article import Article
+from utils.news import Article
 
 
 SCHEMA_SQL = """
@@ -63,7 +63,7 @@ def _from_iso(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value)
 
 
-def utc_now() -> datetime:
+def _utc_now() -> datetime:
     """Current UTC time as a timezone-aware datetime."""
     return datetime.now(timezone.utc)
 
@@ -133,7 +133,7 @@ class Database:
 
     def set_watermark(self, source_key: str, mark: datetime) -> None:
         """Create or update the high-water mark for a source."""
-        now = _to_iso(utc_now())
+        now = _to_iso(_utc_now())
         self._conn.execute(
             """
             INSERT INTO watermarks (source_key, high_water_mark, updated_at)
@@ -153,7 +153,7 @@ class Database:
             INSERT INTO load_runs (source_type, started_at, status)
             VALUES (?, ?, 'running')
             """,
-            (source_type, _to_iso(utc_now())),
+            (source_type, _to_iso(_utc_now())),
         )
         self._conn.commit()
         return int(cursor.lastrowid)
@@ -182,7 +182,7 @@ class Database:
              WHERE id = ?
             """,
             (
-                _to_iso(utc_now()),
+                _to_iso(_utc_now()),
                 status,
                 records_fetched,
                 records_inserted,
@@ -216,6 +216,21 @@ class Database:
             """
         ).fetchall()
         return {row["source_type"]: int(row["n"]) for row in rows}
+
+    def read_articles(self) -> list[dict]:
+        """Return every article that has a title, oldest first.
+
+        Each item has id, title, description, source, source_type, and published_at.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT id, title, description, source, source_type, published_at
+              FROM articles
+             WHERE title IS NOT NULL AND TRIM(title) <> ''
+             ORDER BY published_at, id
+            """
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def close(self) -> None:
         self._conn.close()

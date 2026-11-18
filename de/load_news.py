@@ -8,11 +8,10 @@ from pathlib import Path
 
 from de.GdeltLoader import GdeltLoader
 from de.RssLoader import RssLoader
-from utils.Config import Config
-from utils.Database import Database
-from utils.HttpClient import HttpClient
-from utils.logging_setup import setup_logging
-from utils.LoadResult import LoadResult
+from de.LoadResult import LoadResult
+from utils.config import Config, setup_logging
+from utils.http import HttpClient
+from utils.storage import Database
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

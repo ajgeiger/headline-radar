@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
-from utils.Config import Config
-from utils.Database import Database
-from utils.HttpClient import HttpClient
-from utils.LoadResult import LoadResult
+from de.LoadResult import LoadResult
+from utils.config import Config
+from utils.http import HttpClient
+from utils.storage import Database
 
 
 class NewsLoader(ABC):

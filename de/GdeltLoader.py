@@ -8,13 +8,12 @@ import zipfile
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 
-from utils.Article import Article
-from utils.Database import utc_now
-from utils.HttpError import HttpError
 from de.FileNotReadyError import FileNotReadyError
-from utils.LoadResult import LoadResult
-from utils.NewsLoader import NewsLoader
-from utils.text import blank_to_none, strip_html
+from de.LoadResult import LoadResult
+from de.NewsLoader import NewsLoader
+from utils.http import HttpError
+from utils.news import Article
+from utils.text import TextCleaner
 
 logger = logging.getLogger("headline_radar")
 
@@ -99,7 +98,7 @@ class GdeltLoader(NewsLoader):
         )
 
     def load_new(self) -> LoadResult:
-        now = utc_now().replace(microsecond=0)
+        now = datetime.now(timezone.utc).replace(microsecond=0)
         watermark = self.database.get_watermark(self.source_key)
         if watermark is not None:
             start = watermark
@@ -200,7 +199,7 @@ class GdeltLoader(NewsLoader):
         if not names:
             raise RuntimeError(f"GDELT zip was empty: {url}")
 
-        fetched_at = utc_now()
+        fetched_at = datetime.now(timezone.utc)
         articles: list[Article] = []
         seen_urls: set[str] = set()
         with archive.open(names[0]) as handle:
@@ -225,14 +224,14 @@ class GdeltLoader(NewsLoader):
         fields = line.rstrip("\n").split("\t")
         if len(fields) <= GKG_DOCUMENT_URL:
             return None
-        url = blank_to_none(fields[GKG_DOCUMENT_URL])
+        url = TextCleaner.blank_to_none(fields[GKG_DOCUMENT_URL])
         if url is None:
             return None
 
         extras = fields[GKG_EXTRAS] if len(fields) > GKG_EXTRAS else ""
         title_match = TITLE_RE.search(extras)
         raw_title = title_match.group(1) if title_match else None
-        title = strip_html(raw_title) if raw_title else None
+        title = TextCleaner.strip_html(raw_title) if raw_title else None
 
         published_at = None
         published_match = PUBLISHED_RE.search(extras)
@@ -243,11 +242,11 @@ class GdeltLoader(NewsLoader):
 
         source = "gdelt"
         if len(fields) > GKG_SOURCE_NAME:
-            source = blank_to_none(fields[GKG_SOURCE_NAME]) or "gdelt"
+            source = TextCleaner.blank_to_none(fields[GKG_SOURCE_NAME]) or "gdelt"
 
         language = "English"
         if len(fields) > GKG_TRANSLATION_INFO:
-            translation = blank_to_none(fields[GKG_TRANSLATION_INFO])
+            translation = TextCleaner.blank_to_none(fields[GKG_TRANSLATION_INFO])
             if translation:
                 language = translation
 
