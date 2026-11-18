@@ -4,11 +4,9 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any
-
 import requests
 
-from utils.HttpError import HttpError
+from utils.http.HttpError import HttpError
 
 logger = logging.getLogger("headline_radar")
 
@@ -16,9 +14,9 @@ logger = logging.getLogger("headline_radar")
 class HttpClient:
     """Small wrapper around requests.Session.
 
-    ``min_interval_seconds`` enforces a pause between calls (needed for the
-    GDELT DOC API, which asks for at least five seconds between requests).
-    On 429 or 5xx responses the client waits and retries.
+    min_interval_seconds sets the shortest pause between two requests, so a
+    loader can stay polite to a server. On 429 or 5xx responses the client
+    waits and retries.
     """
 
     def __init__(
@@ -42,14 +40,14 @@ class HttpClient:
         self.retry_after_seconds = retry_after_seconds
         self._last_request_at: float | None = None
 
-    def get(self, url: str, params: dict[str, Any] | None = None) -> requests.Response:
+    def get(self, url: str) -> requests.Response:
         """GET a URL and return the response, retrying transient failures."""
         last_error: Exception | None = None
         for attempt in range(1, self.max_retries + 1):
             self._wait_for_interval()
             try:
                 response = self.session.get(
-                    url, params=params, timeout=self.timeout_seconds
+                    url, timeout=self.timeout_seconds
                 )
                 self._last_request_at = time.monotonic()
                 if response.status_code in {429, 500, 502, 503, 504}:

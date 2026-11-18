@@ -21,3 +21,10 @@ data/*.db-shm
 Thumbs.db
 .idea/
 .vscode/
+
+# Saved models (large, rebuild with fit)
+data/topic_model/
+
+# Pipeline outputs (rebuild with python -m models.run_topic_model)
+outputs/*
+!outputs/.gitkeep
