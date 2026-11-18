@@ -8,12 +8,10 @@ from time import struct_time
 
 import feedparser
 
-from utils.Article import Article
-from utils.RssFeed import RssFeed
-from utils.Database import utc_now
-from utils.LoadResult import LoadResult
-from utils.NewsLoader import NewsLoader
-from utils.text import blank_to_none, strip_html
+from de.LoadResult import LoadResult
+from de.NewsLoader import NewsLoader
+from utils.news import Article, RssFeed
+from utils.text import TextCleaner
 
 logger = logging.getLogger("headline_radar")
 
@@ -37,7 +35,7 @@ class RssLoader(NewsLoader):
     source_type = "rss"
 
     def load_new(self) -> LoadResult:
-        fetched_at = utc_now()
+        fetched_at = datetime.now(timezone.utc)
         articles: list[Article] = []
         for feed in self.config.rss_feeds:
             articles.extend(self._fetch_feed(feed, fetched_at))
@@ -94,7 +92,7 @@ class RssLoader(NewsLoader):
         feed: RssFeed,
         fetched_at: datetime,
     ) -> Article | None:
-        url = blank_to_none(entry.get("link") or entry.get("id"))
+        url = TextCleaner.blank_to_none(entry.get("link") or entry.get("id"))
         if url is None:
             logger.warning("Skipping %s entry with no URL: %s", feed.name, entry.get("title"))
             return None
@@ -104,9 +102,9 @@ class RssLoader(NewsLoader):
             or entry.get("description")
             or _first_content(entry)
         )
-        language = blank_to_none(entry.get("language"))
+        language = TextCleaner.blank_to_none(entry.get("language"))
         if language is None:
-            language = blank_to_none(getattr(entry, "language", None))
+            language = TextCleaner.blank_to_none(getattr(entry, "language", None))
 
         published = struct_time_to_utc(
             entry.get("published_parsed") or entry.get("updated_parsed")
@@ -114,8 +112,8 @@ class RssLoader(NewsLoader):
 
         return Article(
             url=url,
-            title=blank_to_none(entry.get("title")),
-            description=strip_html(raw_description) if raw_description else None,
+            title=TextCleaner.blank_to_none(entry.get("title")),
+            description=TextCleaner.strip_html(raw_description) if raw_description else None,
             source=feed.name,
             source_type=self.source_type,
             published_at=published,

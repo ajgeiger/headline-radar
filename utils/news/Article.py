@@ -1,14 +1,8 @@
-"""Canonical article record used by every news source."""
+"""One article record, shared by every news source."""
 
 from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
-
-
-def article_id_from_url(url: str) -> str:
-    """Return a stable id for an article: SHA-256 of the trimmed URL."""
-    normalized = url.strip()
-    return sha256(normalized.encode("utf-8")).hexdigest()
 
 
 @dataclass
@@ -26,4 +20,5 @@ class Article:
 
     @property
     def id(self) -> str:
-        return article_id_from_url(self.url)
+        """Stable id for the article: SHA-256 of the trimmed URL."""
+        return sha256(self.url.strip().encode("utf-8")).hexdigest()
