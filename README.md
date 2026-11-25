@@ -39,6 +39,7 @@ Some topics pick up publisher boilerplate, such as "targeted news service". The 
 
 - **[TextEmbedder](models/TextEmbedder.py)** builds sentence embeddings straight from the raw transformer output. It averages token vectors with the attention mask so padding never counts, then scales each vector to length 1. It needs no sentence-transformers package and can save and reload the model for offline use.
 - **[TopicModel](models/TopicModel.py)** is my own BERTopic-style pipeline: UMAP, HDBSCAN, and class-based TF-IDF. Copies of the same text vote on one shared topic, and topics that shrink below the minimum size after the vote are pruned again. It tells seen texts from new ones, predicts new ones with HDBSCAN `approximate_predict`, and reports fit diagnostics.
+- **[OutlierReducer](models/OutlierReducer.py)** builds L2-normalized embedding centroids for each discovered topic and reassigns remaining `-1` outliers whose cosine similarity clears a threshold (default `0.45`), while flagging reassigned rows with `is_reassigned_outlier` and leaving `-2` blanks untouched.
 - **[TopicHierarchyPlot](models/TopicHierarchyPlot.py)** compares topics by the cosine distance between their c-TF-IDF vectors and links them with Ward linkage. The Plotly dendrogram shows the combined keywords at every merge point when you hover.
 - **[TopicJoiner](models/TopicJoiner.py)** joins topic ids back onto a table by exact text. It checks that the join keeps the row count, gives blank text `-2`, and raises an error on conflicting ids or on text the model has never seen, which is a sign of drift.
 - **[TopicExplorer](models/TopicExplorer.py)** writes one self-contained HTML page: a 2D UMAP map of every unique text colored by topic, a bar chart of topic sizes, and a table of keywords and example texts. It works offline.
@@ -52,8 +53,9 @@ Some topics pick up publisher boilerplate, such as "targeted news service". The 
 2. Reduce the embeddings to 5 dimensions with UMAP.
 3. Cluster with HDBSCAN.
 4. Give identical texts the same topic. Move any topic smaller than `min_topic_size` to the outliers.
-5. Number topics by size, so topic 0 is the largest.
-6. Describe each topic with c-TF-IDF keywords and three example texts.
+5. Optionally reassign remaining `-1` outliers to their closest topic centroid when cosine similarity clears `outlier_min_similarity`.
+6. Number topics by size, so topic 0 is the largest.
+7. Describe each topic with c-TF-IDF keywords and three example texts.
 
 ```python
 from models import TopicModel
@@ -120,7 +122,7 @@ Re-run the same command at any time. Already-stored URLs are skipped and counted
 
 ```text
 python -m models.run_topic_model
-python -m models.run_topic_model --min-topic-size 20 --output-folder outputs
+python -m models.run_topic_model --min-topic-size 20 --min-samples 5 --outlier-min-similarity 0.45 --output-folder outputs
 ```
 
 `TopicPipeline` reads the articles, fits the model, and saves it to `data/topic_model/`. It writes these files to `outputs/`:
@@ -155,6 +157,7 @@ headline-radar/
     storage/          Database
     text/             TextCleaner, HtmlTextExtractor
   models/             Embedding and topic-model classes
+    OutlierReducer.py Cosine centroid reassignment for outlier texts
     TextEmbedder.py   MiniLM sentence embeddings
     TopicModel.py     UMAP + HDBSCAN + c-TF-IDF topic model
     TopicHierarchyPlot.py
