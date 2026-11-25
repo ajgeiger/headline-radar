@@ -2,6 +2,7 @@
 
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from models.TextEmbedder import TextEmbedder
@@ -16,7 +17,7 @@ class TopicPipeline:
     Files written to output_folder:
         document_topics.csv     one row per article with its topic
         topic_info.csv          one row per topic with size, keywords, and examples
-        fit_diagnostics.csv     cluster sizes before and after the duplicate vote
+        fit_diagnostics.csv     cluster sizes before vote, after vote, and after outlier reduction
         topic_hierarchy.html    interactive dendrogram of topic similarity
         topic_hierarchy.png     the same dendrogram as an image
         topic_explorer.html     document map, topic sizes, and topic table
@@ -27,25 +28,56 @@ class TopicPipeline:
         database_path: str | Path = "data/headline_radar.db",
         output_folder: str | Path = "outputs",
         model_folder: str | Path = "data/topic_model",
-        min_topic_size: int = 30,
+        min_topic_size: int = 20,
+        min_samples: int | None = 5,
+        cluster_selection_method: str = "eom",
+        umap_n_neighbors: int = 15,
+        outlier_min_similarity: float | None = 0.45,
         hierarchy_topics: int = 30,
     ):
         self.database_path = Path(database_path)
         self.output_folder = Path(output_folder)
         self.model_folder = Path(model_folder)
         self.min_topic_size = min_topic_size
+        self.min_samples = min_samples
+        self.cluster_selection_method = cluster_selection_method
+        self.umap_n_neighbors = umap_n_neighbors
+        self.outlier_min_similarity = outlier_min_similarity
         self.hierarchy_topics = hierarchy_topics
 
     def run(self) -> TopicModel:
-        """Run every step and return the fitted model."""
+        """Fit the topic model and write all tables, charts, and model artifacts."""
         self.output_folder.mkdir(parents=True, exist_ok=True)
 
         articles = self.load_articles()
         print(f"Loaded {len(articles):,} articles from {self.database_path}")
 
-        model = TopicModel(min_topic_size=self.min_topic_size, embedder=TextEmbedder())
-        articles["topic_id"] = model.fit_transform(articles["text"])
-        articles["topic_name"] = [model.topic_name(topic) for topic in articles["topic_id"]]
+        cleaned = TopicModel.clean_texts(articles["text"])
+        is_blank = cleaned.eq("").to_numpy()
+        nonblank_texts = cleaned[~is_blank].reset_index(drop=True)
+
+        model = TopicModel(
+            min_topic_size=self.min_topic_size,
+            min_samples=self.min_samples,
+            cluster_selection_method=self.cluster_selection_method,
+            umap_n_neighbors=self.umap_n_neighbors,
+            outlier_min_similarity=self.outlier_min_similarity,
+            embedder=TextEmbedder(),
+        )
+        fitted_topics = model.fit_transform(nonblank_texts)
+
+        topic_ids = np.full(len(articles), TopicModel.BLANK_TOPIC, dtype=np.int32)
+        topic_ids[~is_blank] = fitted_topics
+
+        is_reassigned = np.zeros(len(articles), dtype=bool)
+        is_reassigned[~is_blank] = model.reassigned_outliers_
+
+        articles["topic_id"] = topic_ids
+        articles["topic_name"] = [
+            "Blank (no text)" if topic == TopicModel.BLANK_TOPIC else model.topic_name(int(topic))
+            for topic in topic_ids
+        ]
+        articles["is_reassigned_outlier"] = is_reassigned
 
         model.save(self.model_folder)
         print(f"Saved the model to {self.model_folder}")
@@ -84,7 +116,16 @@ class TopicPipeline:
 
     def write_tables(self, model: TopicModel, articles: pd.DataFrame) -> None:
         """Save the per-article topics, the topic summary, and the fit diagnostics as CSV."""
-        columns = ["id", "published_at", "source", "source_type", "text", "topic_id", "topic_name"]
+        columns = [
+            "id",
+            "published_at",
+            "source",
+            "source_type",
+            "text",
+            "topic_id",
+            "topic_name",
+            "is_reassigned_outlier",
+        ]
         articles[columns].to_csv(self.output_folder / "document_topics.csv", index=False)
 
         topic_info = model.get_topic_info()
@@ -107,6 +148,11 @@ class TopicPipeline:
 
     def print_summary(self, model: TopicModel, articles: pd.DataFrame) -> None:
         topic_count = sum(1 for topic in model.topic_ids_ if topic >= 0)
-        outlier_share = (articles["topic_id"] == TopicModel.OUTLIER_TOPIC).mean()
-        print(f"Found {topic_count} topics. {outlier_share:.0%} of articles are outliers (topic -1).")
+        outlier_count = int((articles["topic_id"] == TopicModel.OUTLIER_TOPIC).sum())
+        outlier_share = float((articles["topic_id"] == TopicModel.OUTLIER_TOPIC).mean())
+        reassigned_count = int(articles["is_reassigned_outlier"].sum())
+        print(
+            f"Found {topic_count} topics. {outlier_count:,} articles ({outlier_share:.2%}) "
+            f"are outliers (topic -1); {reassigned_count:,} outliers were reassigned."
+        )
         print(f"Results are in {self.output_folder}")

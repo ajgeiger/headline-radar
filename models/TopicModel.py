@@ -5,8 +5,9 @@ How it works:
     2. Reduce the embeddings to a few dimensions with UMAP.
     3. Group nearby texts into clusters with HDBSCAN.
     4. Give identical texts the same topic, then drop topics that became too small.
-    5. Number topics by size, so topic 0 is the largest.
-    6. Describe each topic with c-TF-IDF keywords and a few example texts.
+    5. Optionally reassign remaining outliers (-1) to the nearest topic centroid.
+    6. Number topics by size, so topic 0 is the largest.
+    7. Describe each topic with c-TF-IDF keywords and a few example texts.
 
 Topic ids:
     -1 means the text did not fit any topic (an outlier).
@@ -27,6 +28,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import normalize
 from umap import UMAP
 
+from models.OutlierReducer import OutlierReducer
 from models.TextEmbedder import TextEmbedder
 from models.TopicHierarchyPlot import TopicHierarchyPlot
 
@@ -50,20 +52,24 @@ class TopicModel:
 
     def __init__(
         self,
-        min_topic_size: int = 50,
+        min_topic_size: int = 20,
         top_n_words: int = 10,
         batch_size: int = 64,
         random_state: int = 42,
-        min_samples: int | None = None,
+        min_samples: int | None = 5,
         cluster_selection_method: str = "eom",
         embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+        umap_n_neighbors: int = 15,
+        cluster_selection_epsilon: float = 0.0,
+        outlier_min_similarity: float | None = 0.45,
         *,
         embedder=None,
         reducer=None,
         clusterer=None,
         vectorizer=None,
+        outlier_reducer=None,
     ):
-        """Set up the model. Any of the four building blocks can be passed in.
+        """Set up the model. Any of the building blocks can be passed in.
 
         Args:
             min_topic_size: Smallest number of texts a topic may have.
@@ -73,12 +79,25 @@ class TopicModel:
             min_samples: HDBSCAN min_samples. None uses min_topic_size.
             cluster_selection_method: HDBSCAN method, "eom" or "leaf".
             embedding_model_name: Hugging Face model used by the default embedder.
+            umap_n_neighbors: Number of neighbors used by the default UMAP reducer.
+            cluster_selection_epsilon: HDBSCAN cluster_selection_epsilon.
+            outlier_min_similarity: Cosine similarity threshold for OutlierReducer, or None to skip.
             embedder: Object with encode(texts, batch_size, show_progress, as_numpy) and save(folder).
             reducer: Object with fit_transform and transform, such as UMAP.
             clusterer: HDBSCAN model. It needs prediction_data=True to label new texts.
             vectorizer: scikit-learn CountVectorizer used for topic keywords.
+            outlier_reducer: Optional OutlierReducer instance used after clustering.
         """
-        self._check_settings(min_topic_size, top_n_words, batch_size, min_samples, cluster_selection_method)
+        self._check_settings(
+            min_topic_size,
+            top_n_words,
+            batch_size,
+            min_samples,
+            cluster_selection_method,
+            umap_n_neighbors,
+            cluster_selection_epsilon,
+            outlier_min_similarity,
+        )
 
         self.min_topic_size = min_topic_size
         self.top_n_words = top_n_words
@@ -87,20 +106,36 @@ class TopicModel:
         self.min_samples = min_samples
         self.cluster_selection_method = cluster_selection_method
         self.embedding_model_name = embedding_model_name
+        self.umap_n_neighbors = umap_n_neighbors
+        self.cluster_selection_epsilon = float(cluster_selection_epsilon)
+        self.outlier_min_similarity = None if outlier_min_similarity is None else float(outlier_min_similarity)
 
         self.embedder = embedder if embedder is not None else TextEmbedder(embedding_model_name)
         self.reducer = reducer if reducer is not None else self._default_reducer()
         self.clusterer = clusterer if clusterer is not None else self._default_clusterer()
         self.vectorizer = vectorizer if vectorizer is not None else self._default_vectorizer()
+        self.outlier_reducer = outlier_reducer
 
         # Filled in by fit.
         self.document_topics_ = None
         self.c_tf_idf_ = None
         self.topic_labels_ = {}
-
+        self.reassigned_outliers_ = None
+        self.reassigned_counts_ = {}
+        self.reassigned_texts_ = set()
+        self.outlier_reducer_ = None
 
     @staticmethod
-    def _check_settings(min_topic_size, top_n_words, batch_size, min_samples, cluster_selection_method) -> None:
+    def _check_settings(
+        min_topic_size,
+        top_n_words,
+        batch_size,
+        min_samples,
+        cluster_selection_method,
+        umap_n_neighbors,
+        cluster_selection_epsilon,
+        outlier_min_similarity,
+    ) -> None:
         """Fail early on settings that cannot work."""
         if min_topic_size < 2:
             raise ValueError("min_topic_size must be at least 2.")
@@ -112,11 +147,17 @@ class TopicModel:
             raise ValueError("min_samples must be at least 1.")
         if cluster_selection_method not in {"eom", "leaf"}:
             raise ValueError("cluster_selection_method must be 'eom' or 'leaf'.")
+        if umap_n_neighbors < 2:
+            raise ValueError("umap_n_neighbors must be at least 2.")
+        if cluster_selection_epsilon < 0:
+            raise ValueError("cluster_selection_epsilon must be non-negative.")
+        if outlier_min_similarity is not None and not -1.0 <= outlier_min_similarity <= 1.0:
+            raise ValueError("outlier_min_similarity must be between -1.0 and 1.0.")
 
     def _default_reducer(self) -> UMAP:
         """UMAP settings that work well for sentence embeddings."""
         return UMAP(
-            n_neighbors=15,
+            n_neighbors=self.umap_n_neighbors,
             n_components=5,
             min_dist=0.0,
             metric="cosine",
@@ -134,6 +175,7 @@ class TopicModel:
             min_samples=self.min_samples,
             metric="euclidean",
             cluster_selection_method=self.cluster_selection_method,
+            cluster_selection_epsilon=self.cluster_selection_epsilon,
             prediction_data=True,
         )
 
@@ -152,7 +194,6 @@ class TopicModel:
             .str.strip()
             .reset_index(drop=True)
         )
-
 
     def fit(self, texts: Iterable) -> "TopicModel":
         """Learn topics from the texts and return the fitted model."""
@@ -184,16 +225,68 @@ class TopicModel:
         self.voted_cluster_sizes_ = self._count_values(cluster_ids_after_vote)
 
         kept_cluster_ids = self._drop_small_clusters(cluster_ids_after_vote)
-        self.cluster_to_topic_ = self._number_topics_by_size(kept_cluster_ids)
-        self.document_topics_ = np.array(
-            [self.cluster_to_topic_.get(int(cluster), self.OUTLIER_TOPIC) for cluster in kept_cluster_ids],
+        initial_cluster_to_topic = self._number_topics_by_size(kept_cluster_ids)
+        initial_topics = np.array(
+            [initial_cluster_to_topic.get(int(cluster), self.OUTLIER_TOPIC) for cluster in kept_cluster_ids],
             dtype=np.int32,
+        )
+
+        self._assign_final_topics(
+            embeddings=embeddings,
+            text_codes=text_codes,
+            initial_cluster_to_topic=initial_cluster_to_topic,
+            initial_topics=initial_topics,
         )
 
         self._remember_known_texts(text_codes, unique_texts)
         self.topic_sizes_ = self._count_values(self.document_topics_)
         self._describe_topics(texts)
         return self.document_topics_.copy()
+
+    def _assign_final_topics(
+        self,
+        embeddings: np.ndarray,
+        text_codes: np.ndarray,
+        initial_cluster_to_topic: dict[int, int],
+        initial_topics: np.ndarray,
+    ) -> None:
+        """Apply optional outlier reduction and renumber topics by final size."""
+        self.reassigned_outliers_ = np.zeros(len(initial_topics), dtype=bool)
+        self.reassigned_counts_ = {}
+        self.outlier_reducer_ = None
+
+        use_reducer = self.outlier_reducer is not None or self.outlier_min_similarity is not None
+        if not use_reducer or not initial_cluster_to_topic:
+            self.cluster_to_topic_ = initial_cluster_to_topic
+            self.document_topics_ = initial_topics
+            return
+
+        first_row_per_text = np.unique(text_codes, return_index=True)[1]
+        unique_initial_topics = initial_topics[first_row_per_text]
+
+        active_reducer = (
+            self.outlier_reducer
+            if self.outlier_reducer is not None
+            else OutlierReducer(min_similarity=self.outlier_min_similarity)
+        )
+        active_reducer.fit(embeddings, unique_initial_topics)
+        reduced_unique_topics, reassigned_unique, _ = active_reducer.reduce(embeddings, unique_initial_topics)
+
+        reduced_topics = reduced_unique_topics[text_codes]
+        self.reassigned_outliers_ = reassigned_unique[text_codes]
+
+        old_to_new = self._renumber_mapping_by_size(reduced_topics)
+        self.cluster_to_topic_ = {
+            cluster: old_to_new[topic] for cluster, topic in initial_cluster_to_topic.items()
+        }
+        self.document_topics_ = np.array(
+            [old_to_new[int(topic)] if topic >= 0 else self.OUTLIER_TOPIC for topic in reduced_topics],
+            dtype=np.int32,
+        )
+        active_reducer.remap_topics(old_to_new)
+        self.outlier_reducer_ = active_reducer
+        if self.reassigned_outliers_.any():
+            self.reassigned_counts_ = self._count_values(self.document_topics_[self.reassigned_outliers_])
 
     def _check_fit_input(self, texts: pd.Series) -> None:
         """Fit needs enough nonblank texts to form at least one topic."""
@@ -257,12 +350,21 @@ class TopicModel:
         largest_first = sorted(sizes.index, key=lambda cluster: (-int(sizes[cluster]), int(cluster)))
         return {int(cluster): topic for topic, cluster in enumerate(largest_first)}
 
+    @staticmethod
+    def _renumber_mapping_by_size(topic_ids: np.ndarray) -> dict[int, int]:
+        """Map existing topic ids (>= 0) to 0..N-1 sorted by descending document count."""
+        sizes = pd.Series(topic_ids[topic_ids >= 0]).value_counts()
+        largest_first = sorted(sizes.index, key=lambda topic: (-int(sizes[topic]), int(topic)))
+        return {int(old_topic): new_topic for new_topic, old_topic in enumerate(largest_first)}
+
     def _remember_known_texts(self, text_codes: np.ndarray, unique_texts: pd.Index) -> None:
-        """Store {text: topic id} so texts seen during fit get the same answer later."""
+        """Store {text: topic id} and reassigned text set from the fit data."""
         first_row_per_text = np.unique(text_codes, return_index=True)[1]
         topics = self.document_topics_[first_row_per_text]
-        self.known_text_topics_ = dict(zip(unique_texts.tolist(), topics.tolist()))
-
+        reassigned = self.reassigned_outliers_[first_row_per_text]
+        unique_list = unique_texts.tolist()
+        self.known_text_topics_ = dict(zip(unique_list, topics.tolist()))
+        self.reassigned_texts_ = {text for text, flag in zip(unique_list, reassigned) if bool(flag)}
 
     @staticmethod
     def _clean_for_keywords(text: str) -> str:
@@ -353,7 +455,6 @@ class TopicModel:
         best = np.argsort(-similarity, kind="stable")[: self.EXAMPLES_PER_TOPIC]
         return [candidates[i] for i in best]
 
-
     def get_topic_words(self, topic_id: int) -> list[tuple[str, float]]:
         """Return (word, score) pairs for one topic. Unknown ids return []."""
         self._check_is_fitted()
@@ -389,12 +490,14 @@ class TopicModel:
         needs_review is True for a real topic that ended up with no keywords.
         """
         self._check_is_fitted()
+        reassigned_counts = getattr(self, "reassigned_counts_", {})
         rows = []
         for topic in self.topic_ids_:
             words = [word for word, _ in self.get_topic_words(topic)]
             rows.append({
                 "topic_id": topic,
                 "document_count": self.topic_sizes_[topic],
+                "reassigned_count": reassigned_counts.get(topic, 0),
                 "topic_name": f"{topic}: {self.topic_name(topic)}",
                 "needs_review": topic >= 0 and not words,
                 "top_words": words,
@@ -403,38 +506,53 @@ class TopicModel:
         return pd.DataFrame(rows)
 
     def get_fit_diagnostics(self) -> pd.DataFrame:
-        """Compare cluster sizes from HDBSCAN with sizes after the duplicate vote.
+        """Compare cluster sizes from HDBSCAN, after the duplicate vote, and after outlier reduction.
 
         kept is False for outliers and for clusters dropped as too small.
         topic_id is the final topic for kept clusters, otherwise -1.
         """
         self._check_is_fitted()
         cluster_ids = sorted(set(self.raw_cluster_sizes_) | set(self.voted_cluster_sizes_))
+        reassigned_counts = getattr(self, "reassigned_counts_", {})
         rows = []
         for cluster in cluster_ids:
+            kept = cluster in self.cluster_to_topic_
+            topic_id = self.cluster_to_topic_.get(cluster, self.OUTLIER_TOPIC)
+            if cluster == self.OUTLIER_TOPIC:
+                reassigned_count = 0
+                final_count = self.topic_sizes_.get(self.OUTLIER_TOPIC, 0)
+            elif kept:
+                reassigned_count = reassigned_counts.get(topic_id, 0)
+                final_count = self.topic_sizes_.get(topic_id, 0)
+            else:
+                reassigned_count = 0
+                final_count = 0
+
             rows.append({
                 "cluster_id": cluster,
                 "hdbscan_count": self.raw_cluster_sizes_.get(cluster, 0),
                 "count_after_vote": self.voted_cluster_sizes_.get(cluster, 0),
-                "kept": cluster in self.cluster_to_topic_,
-                "topic_id": self.cluster_to_topic_.get(cluster, self.OUTLIER_TOPIC),
+                "kept": kept,
+                "topic_id": topic_id,
+                "reassigned_count": reassigned_count,
+                "final_count": final_count,
             })
         return pd.DataFrame(rows)
-
 
     def transform(self, texts: Iterable) -> np.ndarray:
         """Return one topic id per text.
 
         Blank texts get -2. Texts seen during fit get their fitted topic.
-        New texts are embedded and labeled with HDBSCAN approximate_predict.
+        New texts are embedded and labeled with HDBSCAN approximate_predict
+        followed by OutlierReducer when fitted.
         """
         return self.transform_with_status(texts)["topic_id"].to_numpy()
 
     def transform_with_status(self, texts: Iterable) -> pd.DataFrame:
         """Like transform, but also say how each topic was found.
 
-        Columns: text, topic_id, status. status is "blank", "seen" (the text
-        was in the fit data), or "new" (the topic was predicted).
+        Columns: text, topic_id, status, is_reassigned_outlier. status is
+        "blank", "seen" (the text was in the fit data), or "new" (predicted).
         """
         self._check_is_fitted()
         texts = self.clean_texts(texts)
@@ -444,17 +562,38 @@ class TopicModel:
         is_new = ~is_blank & ~is_seen
 
         topic_ids = np.full(len(texts), self.BLANK_TOPIC, dtype=np.int32)
-        topic_ids[is_seen.to_numpy()] = texts[is_seen].map(self.known_text_topics_).to_numpy(dtype=np.int32)
+        reassigned_flags = np.zeros(len(texts), dtype=bool)
+        reassigned_texts = getattr(self, "reassigned_texts_", set())
+
+        if is_seen.any():
+            seen_mask = is_seen.to_numpy()
+            topic_ids[seen_mask] = texts[is_seen].map(self.known_text_topics_).to_numpy(dtype=np.int32)
+            reassigned_flags[seen_mask] = texts[is_seen].isin(reassigned_texts).to_numpy(dtype=bool)
+
         if is_new.any():
-            topic_ids[is_new.to_numpy()] = self._predict_new_texts(texts[is_new])
+            new_mask = is_new.to_numpy()
+            new_topics, new_reassigned = self._predict_new_texts_with_flags(texts[is_new])
+            topic_ids[new_mask] = new_topics
+            reassigned_flags[new_mask] = new_reassigned
 
         status = np.select([is_blank, is_seen], ["blank", "seen"], default="new")
-        return pd.DataFrame({"text": texts, "topic_id": topic_ids, "status": status})
+        return pd.DataFrame({
+            "text": texts,
+            "topic_id": topic_ids,
+            "status": status,
+            "is_reassigned_outlier": reassigned_flags,
+        })
 
     def _predict_new_texts(self, texts: pd.Series) -> np.ndarray:
         """Embed texts the model has not seen and place them in the nearest topic or -1."""
+        topics, _ = self._predict_new_texts_with_flags(texts)
+        return topics
+
+    def _predict_new_texts_with_flags(self, texts: pd.Series) -> tuple[np.ndarray, np.ndarray]:
+        """Predict new texts with HDBSCAN approximate_predict and optional OutlierReducer."""
         text_codes, unique_texts = pd.factorize(texts, sort=False)
-        reduced = self.reducer.transform(self.embed(unique_texts.tolist()))
+        embeddings = self.embed(unique_texts.tolist())
+        reduced = self.reducer.transform(embeddings)
         try:
             cluster_ids, _ = approximate_predict(self.clusterer, reduced)
         except (AttributeError, ValueError) as error:
@@ -464,8 +603,12 @@ class TopicModel:
             [self.cluster_to_topic_.get(int(cluster), self.OUTLIER_TOPIC) for cluster in cluster_ids],
             dtype=np.int32,
         )
-        return topics[text_codes]
+        reassigned = np.zeros(len(unique_texts), dtype=bool)
+        outlier_reducer = getattr(self, "outlier_reducer_", None)
+        if outlier_reducer is not None:
+            topics, reassigned, _ = outlier_reducer.reduce(embeddings, topics)
 
+        return topics[text_codes], reassigned[text_codes]
 
     def visualize_hierarchy(self, top_n_topics: int = 30, labeled_merges: int = 0):
         """Return a Plotly dendrogram of how similar the largest topics are.
